@@ -51,6 +51,21 @@ pool_test_() ->
             {<<"Pool returns status">>,
                 fun pool_returns_status/0
             },
+            {<<"Pool returns stats">>,
+                fun pool_returns_stats/0
+            },
+            {<<"Stats count a wait served on checkin">>,
+                fun stats_count_wait_served_on_checkin/0
+            },
+            {<<"Stats count a wait served when a worker exits">>,
+                fun stats_count_wait_served_on_worker_exit/0
+            },
+            {<<"Stats count a wait cancelled by a checkout timeout">>,
+                fun stats_count_cancelled_wait/0
+            },
+            {<<"Stats count a wait ended by the caller dying">>,
+                fun stats_count_wait_of_dead_caller/0
+            },
             {<<"Pool demonitors previously waiting processes">>,
                 fun demonitors_previously_waiting_processes/0
             },
@@ -446,6 +461,69 @@ pool_returns_status() ->
     ?assertEqual({full, 0, 0, 0}, poolboy:status(Pool4)),
     ok = pool_call(Pool4, stop).
 
+pool_returns_stats() ->
+    {ok, Pool} = new_pool(2, 1),
+    ?assertEqual(#{idle => 2, checked_out => 0, overflow => 0,
+                   waiting => 0, waits => 0, wait_time => 0},
+                 poolboy:stats(Pool)),
+    poolboy:checkout(Pool),
+    poolboy:checkout(Pool),
+    poolboy:checkout(Pool),
+    ?assertEqual(full, poolboy:checkout(Pool, false)),
+    %% None of these checkouts had to queue for a worker.
+    ?assertEqual(#{idle => 0, checked_out => 3, overflow => 1,
+                   waiting => 0, waits => 0, wait_time => 0},
+                 poolboy:stats(Pool, 1000)),
+    ok = pool_call(Pool, stop).
+
+stats_count_wait_served_on_checkin() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    Waiter = spawn_waiter(Pool),
+    await_waiting(Pool, 1),
+    ?assertMatch(#{waiting := 1, waits := 1, wait_time := 0},
+                 poolboy:stats(Pool)),
+    timer:sleep(50),
+    ok = poolboy:checkin(Pool, Worker),
+    ?assertEqual(Worker, await_served(Waiter)),
+    #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
+    ?assert(WaitTime >= 50000),
+    ok = pool_call(Pool, stop).
+
+stats_count_wait_served_on_worker_exit() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    Waiter = spawn_waiter(Pool),
+    await_waiting(Pool, 1),
+    timer:sleep(50),
+    kill_worker(Worker),
+    NewWorker = await_served(Waiter),
+    ?assert(NewWorker =/= Worker),
+    #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
+    ?assert(WaitTime >= 50000),
+    ok = pool_call(Pool, stop).
+
+stats_count_cancelled_wait() ->
+    {ok, Pool} = new_pool(1, 0),
+    poolboy:checkout(Pool),
+    ?assertExit({timeout, _}, poolboy:checkout(Pool, true, 50)),
+    %% The cancel_waiting cast reaches the pool before this call does.
+    #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
+    ?assert(WaitTime > 0),
+    ok = pool_call(Pool, stop).
+
+stats_count_wait_of_dead_caller() ->
+    {ok, Pool} = new_pool(1, 0),
+    poolboy:checkout(Pool),
+    Waiter = spawn_waiter(Pool),
+    await_waiting(Pool, 1),
+    timer:sleep(50),
+    exit(Waiter, kill),
+    await_waiting(Pool, 0),
+    #{waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
+    ?assert(WaitTime >= 50000),
+    ok = pool_call(Pool, stop).
+
 demonitors_previously_waiting_processes() ->
     {ok, Pool} = new_pool(1,0),
     Self = self(),
@@ -528,6 +606,38 @@ reuses_waiting_monitor_on_worker_exit() ->
 
     Pid ! ok,
     ok = pool_call(Pool, stop).
+
+%% A process that checks out a worker and reports it to us, then lives
+%% on so the worker stays checked out.
+spawn_waiter(Pool) ->
+    Self = self(),
+    spawn(fun() ->
+        Worker = poolboy:checkout(Pool, true, infinity),
+        Self ! {served, self(), Worker},
+        receive ok -> ok end
+    end).
+
+await_served(Waiter) ->
+    receive
+        {served, Waiter, Worker} -> Worker
+    after 1000 ->
+        error(not_served)
+    end.
+
+%% The waiter's checkout reaches the pool asynchronously, so poll.
+await_waiting(Pool, N) ->
+    await_waiting(Pool, N, 50).
+
+await_waiting(Pool, N, Retries) ->
+    case poolboy:stats(Pool) of
+        #{waiting := N} ->
+            ok;
+        _ when Retries > 0 ->
+            timer:sleep(10),
+            await_waiting(Pool, N, Retries - 1);
+        Stats ->
+            error({not_waiting, N, Stats})
+    end.
 
 get_monitors(Pid) ->
     %% Synchronise with the Pid to ensure it has handled all expected work.

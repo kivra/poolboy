@@ -158,6 +158,24 @@ code_change(_OldVsn, State, _Extra) ->
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 
+## Stats
+
+`poolboy:stats(Pool)` (or `poolboy:stats(Pool, Timeout)`) returns a map:
+
+- `idle`: workers available for checkout
+- `checked_out`: workers checked out, overflow workers included
+- `overflow`: overflow workers running beyond `size`
+- `waiting`: callers currently queued for a worker
+- `waits`: checkouts that have had to queue for a worker since the pool
+  started, counted when they are queued
+- `wait_time`: total time in microseconds those checkouts spent queued,
+  added when each leaves the queue (served, cancelled by a checkout timeout,
+  or because the caller died)
+
+`waits` and `wait_time` only grow, so they can be exported as counters to
+alert on any checkout that had to wait. A checkout that gets a worker straight
+away costs nothing extra.
+
 ## Authors
 
 - Devin Torres (devinus) <devin@devintorres.com>

@@ -5,10 +5,10 @@
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3, start/1, start/2,
-         start_link/1, start_link/2, stop/1, status/1]).
+         start_link/1, start_link/2, stop/1, status/1, stats/1, stats/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
--export_type([pool/0]).
+-export_type([pool/0, stats/0]).
 
 -define(TIMEOUT, 5000).
 
@@ -33,6 +33,17 @@
     {global, GlobalName :: any()} |
     {via, Module :: atom(), ViaName :: any()}.
 
+%% Checkouts that had to queue for a worker are counted when they are
+%% queued, and their time in the queue is added to `wait_time' (in
+%% microseconds) when they leave it: served, cancelled or died. Both are
+%% cumulative for the lifetime of the pool process.
+-type stats() :: #{idle := non_neg_integer(),
+                   checked_out := non_neg_integer(),
+                   overflow := non_neg_integer(),
+                   waiting := non_neg_integer(),
+                   waits := non_neg_integer(),
+                   wait_time := non_neg_integer()}.
+
 % Copied from gen:start_ret/0
 -type start_ret() :: {'ok', pid()} | 'ignore' | {'error', term()}.
 
@@ -44,7 +55,9 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    waits = 0 :: non_neg_integer(),
+    wait_time = 0 :: non_neg_integer()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -130,6 +143,14 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+-spec stats(Pool :: pool()) -> stats().
+stats(Pool) ->
+    stats(Pool, ?TIMEOUT).
+
+-spec stats(Pool :: pool(), Timeout :: timeout()) -> stats().
+stats(Pool, Timeout) ->
+    gen_server:call(Pool, stats, Timeout).
+
 init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
@@ -172,14 +193,10 @@ handle_cast({cancel_waiting, CRef}, State) ->
             NewState = handle_checkin(Pid, State),
             {noreply, NewState};
         [] ->
-            Cancel = fun({_, Ref, MRef}) when Ref =:= CRef ->
-                             demonitor(MRef, [flush]),
-                             false;
-                        (_) ->
-                             true
-                     end,
-            Waiting = queue:filter(Cancel, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
+            {Cancelled, NewState} =
+                remove_waiting(fun({_, Ref, _, _}) -> Ref =:= CRef end, State),
+            [demonitor(MRef, [flush]) || {_, _, MRef, _} <- Cancelled],
+            {noreply, NewState}
     end;
 
 handle_cast(_Msg, State) ->
@@ -204,8 +221,10 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
             {reply, full, State};
         [] ->
             MRef = erlang:monitor(process, FromPid),
-            Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
+            QueuedAt = erlang:monotonic_time(),
+            Waiting = queue:in({From, CRef, MRef, QueuedAt}, State#state.waiting),
+            {noreply, State#state{waiting = Waiting,
+                                  waits = State#state.waits + 1}}
     end;
 
 handle_call(status, _From, State) ->
@@ -214,6 +233,21 @@ handle_call(status, _From, State) ->
            overflow = Overflow} = State,
     StateName = state_name(State),
     {reply, {StateName, length(Workers), Overflow, ets:info(Monitors, size)}, State};
+handle_call(stats, _From, State) ->
+    #state{workers = Workers,
+           waiting = Waiting,
+           monitors = Monitors,
+           overflow = Overflow,
+           waits = Waits,
+           wait_time = WaitTime} = State,
+    Stats = #{idle => length(Workers),
+              checked_out => ets:info(Monitors, size),
+              overflow => Overflow,
+              waiting => queue:len(Waiting),
+              waits => Waits,
+              wait_time => erlang:convert_time_unit(WaitTime, native,
+                                                    microsecond)},
+    {reply, Stats, State};
 handle_call(get_avail_workers, _From, State) ->
     Workers = State#state.workers,
     {reply, Workers, State};
@@ -238,8 +272,9 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
             NewState = handle_checkin(Pid, State),
             {noreply, NewState};
         [] ->
-            Waiting = queue:filter(fun ({_, _, R}) -> R =/= MRef end, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
+            {_, NewState} =
+                remove_waiting(fun ({_, _, R, _}) -> R =:= MRef end, State),
+            {noreply, NewState}
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
@@ -310,10 +345,11 @@ handle_checkin(Pid, State) ->
            overflow = Overflow,
            strategy = Strategy} = State,
     case queue:out(Waiting) of
-        {{value, {From, CRef, MRef}}, Left} ->
+        {{value, {From, CRef, MRef, QueuedAt}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
-            State#state{waiting = Left};
+            add_wait_time(QueuedAt, erlang:monotonic_time(),
+                          State#state{waiting = Left});
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
@@ -330,11 +366,12 @@ handle_worker_exit(Pid, State) ->
            monitors = Monitors,
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
-        {{value, {From, CRef, MRef}}, LeftWaiting} ->
+        {{value, {From, CRef, MRef, QueuedAt}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
             true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
             gen_server:reply(From, NewWorker),
-            State#state{waiting = LeftWaiting};
+            add_wait_time(QueuedAt, erlang:monotonic_time(),
+                          State#state{waiting = LeftWaiting});
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
@@ -343,6 +380,21 @@ handle_worker_exit(Pid, State) ->
                  | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
             State#state{workers = Workers, waiting = Empty}
     end.
+
+%% Removes the waiting callers Pred matches from the queue and adds their
+%% time in it to wait_time.
+remove_waiting(Pred, State = #state{waiting = Waiting}) ->
+    {Removed, Left} = lists:partition(Pred, queue:to_list(Waiting)),
+    Now = erlang:monotonic_time(),
+    NewState = lists:foldl(fun ({_, _, _, QueuedAt}, S) ->
+                                   add_wait_time(QueuedAt, Now, S)
+                           end,
+                           State#state{waiting = queue:from_list(Left)},
+                           Removed),
+    {Removed, NewState}.
+
+add_wait_time(QueuedAt, Now, State = #state{wait_time = WaitTime}) ->
+    State#state{wait_time = WaitTime + (Now - QueuedAt)}.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
     #state{max_overflow = MaxOverflow, workers = Workers} = State,
