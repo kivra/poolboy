@@ -33,10 +33,7 @@
     {global, GlobalName :: any()} |
     {via, Module :: atom(), ViaName :: any()}.
 
-%% Checkouts that had to queue for a worker are counted when they are
-%% queued, and their time in the queue is added to `wait_time' (in
-%% microseconds) when they leave it: served, cancelled or died. Both are
-%% cumulative for the lifetime of the pool process.
+%% waits and wait_time (in microseconds) only grow; see the README.
 -type stats() :: #{idle := non_neg_integer(),
                    checked_out := non_neg_integer(),
                    overflow := non_neg_integer(),
@@ -195,7 +192,9 @@ handle_cast({cancel_waiting, CRef}, State) ->
         [] ->
             {Cancelled, NewState} =
                 remove_waiting(fun({_, Ref, _, _}) -> Ref =:= CRef end, State),
-            [demonitor(MRef, [flush]) || {_, _, MRef, _} <- Cancelled],
+            ok = lists:foreach(fun ({_, _, MRef, _}) ->
+                                       demonitor(MRef, [flush])
+                               end, Cancelled),
             {noreply, NewState}
     end;
 

@@ -66,6 +66,12 @@ pool_test_() ->
             {<<"Stats count a wait ended by the caller dying">>,
                 fun stats_count_wait_of_dead_caller/0
             },
+            {<<"Stats count the waits of several queued callers">>,
+                fun stats_count_waits_of_several_callers/0
+            },
+            {<<"Stats count a wait served after its checkout timed out once">>,
+                fun stats_count_wait_served_after_timeout/0
+            },
             {<<"Pool demonitors previously waiting processes">>,
                 fun demonitors_previously_waiting_processes/0
             },
@@ -479,6 +485,7 @@ pool_returns_stats() ->
 stats_count_wait_served_on_checkin() ->
     {ok, Pool} = new_pool(1, 0),
     Worker = poolboy:checkout(Pool),
+    T0 = erlang:monotonic_time(microsecond),
     Waiter = spawn_waiter(Pool),
     await_waiting(Pool, 1),
     ?assertMatch(#{waiting := 1, waits := 1, wait_time := 0},
@@ -487,12 +494,14 @@ stats_count_wait_served_on_checkin() ->
     ok = poolboy:checkin(Pool, Worker),
     ?assertEqual(Worker, await_served(Waiter)),
     #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
-    ?assert(WaitTime >= 50000),
+    assert_wait_time(50000, WaitTime, T0),
+    Waiter ! ok,
     ok = pool_call(Pool, stop).
 
 stats_count_wait_served_on_worker_exit() ->
     {ok, Pool} = new_pool(1, 0),
     Worker = poolboy:checkout(Pool),
+    T0 = erlang:monotonic_time(microsecond),
     Waiter = spawn_waiter(Pool),
     await_waiting(Pool, 1),
     timer:sleep(50),
@@ -500,28 +509,82 @@ stats_count_wait_served_on_worker_exit() ->
     NewWorker = await_served(Waiter),
     ?assert(NewWorker =/= Worker),
     #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
-    ?assert(WaitTime >= 50000),
+    assert_wait_time(50000, WaitTime, T0),
+    Waiter ! ok,
     ok = pool_call(Pool, stop).
 
 stats_count_cancelled_wait() ->
     {ok, Pool} = new_pool(1, 0),
     poolboy:checkout(Pool),
+    T0 = erlang:monotonic_time(microsecond),
     ?assertExit({timeout, _}, poolboy:checkout(Pool, true, 50)),
     %% The cancel_waiting cast reaches the pool before this call does.
     #{waiting := 0, waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
-    ?assert(WaitTime > 0),
+    %% Queued from shortly after T0 until the 50 ms call timeout.
+    assert_wait_time(40000, WaitTime, T0),
     ok = pool_call(Pool, stop).
 
 stats_count_wait_of_dead_caller() ->
     {ok, Pool} = new_pool(1, 0),
     poolboy:checkout(Pool),
+    T0 = erlang:monotonic_time(microsecond),
     Waiter = spawn_waiter(Pool),
     await_waiting(Pool, 1),
     timer:sleep(50),
     exit(Waiter, kill),
     await_waiting(Pool, 0),
     #{waits := 1, wait_time := WaitTime} = poolboy:stats(Pool),
-    ?assert(WaitTime >= 50000),
+    assert_wait_time(50000, WaitTime, T0),
+    ok = pool_call(Pool, stop).
+
+%% Of two queued callers the first dies; only its wait ends there, and
+%% the second still gets the next worker checked in.
+stats_count_waits_of_several_callers() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    T0 = erlang:monotonic_time(microsecond),
+    First = spawn_waiter(Pool),
+    await_waiting(Pool, 1),
+    Second = spawn_waiter(Pool),
+    await_waiting(Pool, 2),
+    timer:sleep(50),
+    exit(First, kill),
+    await_waiting(Pool, 1),
+    ?assertMatch(#{waits := 2, wait_time := FirstWait}
+                   when FirstWait >= 50000,
+                 poolboy:stats(Pool)),
+    ok = poolboy:checkin(Pool, Worker),
+    ?assertEqual(Worker, await_served(Second)),
+    #{waiting := 0, waits := 2, wait_time := WaitTime} = poolboy:stats(Pool),
+    %% Both waited at least the 50 ms and at most the whole test.
+    T1 = erlang:monotonic_time(microsecond),
+    ?assert(WaitTime >= 100000),
+    ?assert(WaitTime =< 2 * (T1 - T0)),
+    Second ! ok,
+    ok = pool_call(Pool, stop).
+
+%% A caller whose checkout times out just as it is served gets no worker,
+%% and its cancel_waiting must check the worker in again without counting
+%% the wait twice. Suspending the pool lines up checkout, checkin and
+%% cancel_waiting in its mailbox in that order.
+stats_count_wait_served_after_timeout() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    ok = sys:suspend(Pool),
+    Self = self(),
+    Caller = spawn(fun() ->
+        {'EXIT', {timeout, _}} = (catch poolboy:checkout(Pool, true, 100)),
+        Self ! {timed_out, self()},
+        receive ok -> ok end
+    end),
+    await_message_queue_len(Pool, 1),
+    ok = poolboy:checkin(Pool, Worker),
+    receive {timed_out, Caller} -> ok after 1000 -> error(no_timeout) end,
+    await_message_queue_len(Pool, 3),
+    ok = sys:resume(Pool),
+    ?assertMatch(#{idle := 1, checked_out := 0, waiting := 0, waits := 1},
+                 poolboy:stats(Pool)),
+    Caller ! ok,
     ok = pool_call(Pool, stop).
 
 demonitors_previously_waiting_processes() ->
@@ -637,6 +700,27 @@ await_waiting(Pool, N, Retries) ->
             await_waiting(Pool, N, Retries - 1);
         Stats ->
             error({not_waiting, N, Stats})
+    end.
+
+%% WaitTime is at least Min, and at most the time since T0, which the
+%% test took before the wait began.
+assert_wait_time(Min, WaitTime, T0) ->
+    T1 = erlang:monotonic_time(microsecond),
+    ?assert(WaitTime >= Min),
+    ?assert(WaitTime =< T1 - T0).
+
+await_message_queue_len(Pid, N) ->
+    await_message_queue_len(Pid, N, 50).
+
+await_message_queue_len(Pid, N, Retries) ->
+    case erlang:process_info(Pid, message_queue_len) of
+        {message_queue_len, N} ->
+            ok;
+        _ when Retries > 0 ->
+            timer:sleep(10),
+            await_message_queue_len(Pid, N, Retries - 1);
+        Len ->
+            error({message_queue_len, N, Len})
     end.
 
 get_monitors(Pid) ->

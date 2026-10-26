@@ -174,7 +174,12 @@ code_change(_OldVsn, State, _Extra) ->
 
 `waits` and `wait_time` only grow, so they can be exported as counters to
 alert on any checkout that had to wait. A checkout that gets a worker straight
-away costs nothing extra.
+away costs nothing extra. Both restart from zero with the pool process, and
+neither includes time a checkout spends in the pool's message queue before
+the pool handles it.
+
+The pool's internal state changed shape along with these counters, so pools
+running an earlier version can't be hot upgraded to this one; restart them.
 
 ## Authors
 
